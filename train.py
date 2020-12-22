@@ -6,41 +6,49 @@ from glob import glob
 import os
 import torch
 
-def train(bot, bot_op, optimizer, **kwargs):
-    interval = kwargs.get("interval", 30)
-    n_it = kwargs.get("n_it", 50)
+def train(bot, bot_op, optimizer, err, **kwargs):
+    interval = kwargs.get("interval", 100)
+    n_it = kwargs.get("n_it", 10)
     device = kwargs.get("device")    
+    n_games = kwargs.get("n_games", 10)
     
-    rewards = []
-    exp_rewards = []
-    for _ in range(n_it):
-        dists = []
-        op_dists = []
-        for i in range(interval):
-            dists.append(bot.dist)
-            op_dists.append(bot_op.dist)
+    for _ in range(n_games):
+        rewards = []
+        for _ in range(n_it):
+            hidden_states = []
+            targets = []
+            seqs = []
+            for i in range(interval):
+                seq = []
+                m1 = bot.throw()
+                m2 = bot_op.throw()
+                
+                seq.append(m2.item())
+              
+                reward = WIN[m1,m2]
+                rewards.append(reward.item())
 
-            m1 = bot.throw()
-            m2 = bot_op.throw()
-            reward = WIN[m1,m2]
-            rewards.append(reward.item())
-
-            m1 = m1.to(device)
-            bot.observe(m1, reward)
-            bot_op.observe(m2, -reward)
+                m1 = m1.to(device)
+                bot.observe(m1, reward)
+                bot_op.observe(m2, -reward)
+            seqs.append(seq)
+            hidden_states.append( bot.hidden_state)
+            targ = bot_op.throw().item() 
+            targets.append(targ)
         
-        exp_reward = 0.
-        for i in range(len(dists)):
-            exp_reward += expected_reward( dists[i], op_dists[i], device)
-        exp_reward /= interval
-        loss = -exp_reward
-        exp_rewards.append(exp_reward.item())
+        inputs = torch.tensor(seqs).to(device)
+        targets = torch.Tensor(targets).to(device)
+        hidden_states = torch.cat( hidden_states, dim = 1).to(device)
+        outputs, _ = bot(inputs, hidden_states)
+        loss = err( outputs, targets)
 
         #backpropagate
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-    return exp_rewards, rewards
+
+        print(f"score: {sum(rewards)}/{len(rewards)}")
+    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = "training script for Janken bot")
@@ -66,7 +74,7 @@ if __name__ == "__main__":
         j.load_state_dict(weight["model_state_dict"])
         j.id = weight["id"]
 
-    optimizer = torch.optim.AdamW(j.parameters(), lr = 1e-3)
+    optimizer = torch.optim.AdamW(j.parameters(), lr = 0.01)
     optim_path = os.path.join( os.getcwd(), "weights", f"adam_w.pt")
     if os.path.exists(optim_path):
         param = torch.load(optim_path, map_location = device)
@@ -82,10 +90,10 @@ if __name__ == "__main__":
     for epoch in range(args.e):
         for _ in range(args.n):
             #choose the opponent and random hyperparameters
-            opps = ["dumb", "exp3r", "ucb"] + 2*["rnn"]
+            opps = ["rand", "exp3r", "ser", "ucb", "rnn"]
             r = randint(0, len(opps)-1)
 
-            if opps[r] == "dumb":
+            if opps[r] == "rand":
                 reset_time = randint(2,30)
                 b = 0.2*torch.rand(1).item()
                 j_op = dumbJanken(bias = b, reset_prob = 1/reset_time)
@@ -100,6 +108,14 @@ if __name__ == "__main__":
                 e = 0.5*torch.rand(1)
                 j_op = ucbJanken(gamma = exploration.item(),
                                  epsilon = e.item())
+
+            elif oppps[r] == "ser":
+                reset_time = randint(2,30)
+                epsilon = 0.8*torch.rand(1)
+                delta = 0.5*torch.rand(1) 
+                j_op = serJanker(delta = delta.item(),
+                                reset_prob = 1/reset_time,
+                                epsilon = epsilon.item())
 
             elif opps[r] == "rnn" or opps[r] == "pucb":
                 n = randint(0, len(weight_paths) -1)

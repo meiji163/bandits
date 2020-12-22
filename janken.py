@@ -23,19 +23,19 @@ def expected_reward(dist_1, dist_2, device = None):
         return dist_1.to(device)@ WIN.to(device)@ dist_2.to(device)
     return dist_1 @ WIN @ dist_2
 
-class JankenRNN(nn.Module):
+class gruJanken(nn.Module):
     '''A GRU to play Janken. 
     Input: previous opponent move
     Output: policy distribution
     '''
     def __init__(self, device = None):
-        super(JankenRNN, self).__init__()
+        super(gruJanken, self).__init__()
         self.id = 0  
         self.device = device 
-        self.hidden_size = 90 
+        self.hidden_size = 64 
         self.gru = nn.GRU(3, self.hidden_size,
-                                num_layers = 6, 
-                                dropout = 0.3,
+                                num_layers = 8, 
+                                dropout = 0.5,
                                 batch_first = True)
         self.lin = nn.Linear(self.hidden_size, 3)
         self.softmax = nn.Softmax(dim = 1)
@@ -54,29 +54,29 @@ class JankenRNN(nn.Module):
         else:
             y, new_h = self.gru(x, h)
         out = self.lin(self.relu(y[:,-1]))
-        return self.softmax(out), new_h
+        return out, new_h
     
     def observe(self, move, reward, device = None):
         last = ((move - reward)%3).long().unsqueeze(0)
         if device:
             last = last.to(device) 
         out, h = self.forward(last.unsqueeze(0), self.hidden_state)
-        self.hidden_state = h.data
-        self.dist = out.squeeze(0)
+        self.hidden_state = h
+        self.dist = self.softmax(out).squeeze(0)
  
     def throw(self):
         policy = Categorical(self.dist)
         return policy.sample()
-    
-class dumbJanken():
-    '''Dumb janken player chooses a random policy distribution and randomly resets it.
+   
+class randJanken():
+    '''Random janken player chooses a random policy distribution and randomly resets it.
     kwargs:
         reset_prob (float): probability of resetting at each turn
         dists: list of distributions to use
         bias (float): scalar to determine biasing towards moves that previously won'''
     def __init__(self, reset_prob = 0.015, **kwargs):
         #expected reset time = 1/(reset_prob)
-        self.reset = Bernoulli(torch.tensor([reset_prob]))
+        self.reset = Bernoulli(torch.tensor(reset_prob))
         self.dists = kwargs.get("dists")
         self.bias = kwargs.get("bias")
 
@@ -158,14 +158,7 @@ class exp3rJanken():
         self.observations = [0,0,0]    
 
     def throw(self):
-        try:
-            return self.policy.sample()
-        except:
-            print("FAILURE")
-            print(self.dist)
-            print(f"observations: {self.observations}")
-            print(f"weights: {self.weights}")
-            print(self.rewards)
+        return self.policy.sample()
 
     @property
     def dist(self):
@@ -175,11 +168,16 @@ class ucbJanken():
     '''UCB algorithm with epsilon-greedy selection
     kwargs:
         gamma (float): exploration constant
-        epsilon (float): probability of choosing randomly'''
+        epsilon (float): probability of choosing randomly
+        reset_prob (float): probability of resetting
+    '''
     def __init__(self, **kwargs):
         self.gamma = kwargs.get("gamma", 0.5)
         self.epsilon = kwargs.get("epsilon", 0.1)
-        self.coin = Bernoulli(torch.tensor(self.epsilon))
+        reset_prob = kwargs.get("reset_prob")
+        self.reset = Bernoulli(torch.tensor(reset_prob))
+
+        self.explore = Bernoulli(torch.tensor(self.epsilon))
         self.visits = [0,0,0]
         self.rewards = [0.,0.,0.]
     
@@ -187,7 +185,8 @@ class ucbJanken():
         return f"ucb: gamma = {self.gamma:.3f}, epsilon = {self.epsilon:.3f}"
 
     def observe(self, move, reward):
-        '''move (torch.tensor)'''
+        m = move.item() if isinstance(move, torch.Tensor) else move
+        r = reward.item() if isinstance(reward, torch.Tensor) else reward
         self.rewards[move.item()] += reward.item()
 
     def ucb(self, m):
@@ -200,7 +199,7 @@ class ucbJanken():
         if sum(self.visits) == 0:
             m = randint(0,2) 
         else:
-            r = self.coin.sample()
+            r = self.explore.sample()
             if r.item() == 1:
                 m = randint(0,2)
             else:
@@ -241,7 +240,7 @@ class pucbJanken(ucbJanken):
         if sum(self.visits) == 0:
             m = randint(0,2) 
         else:
-            r = self.coin.sample()
+            r = self.explore.sample()
             if r.item() == 1:
                 m = randint(0,2)
             else:
@@ -257,3 +256,81 @@ class pucbJanken(ucbJanken):
         d = torch.zeros(3)
         d[best] = 1.0
         d = (1-self.epsilon)*d + (self.epsilon/3)*torch.ones(3)
+
+class serJanken():
+    def __init__(self, **kwargs):
+        self.delta = kwargs.get("delta", 0.35)
+        self.epsilon = kwargs.get("epsilon", 0.3)
+        reset_prob = kwargs.get("reset_prob", 0.1)
+        self.coin= Bernoulli(torch.tensor( reset_prob))
+        self.means = [0.,0.,0.] 
+        self.arms = {0,1,2}
+        self.not_played = [0,1,2]
+
+        self.thresh = int(log(3.0/self.delta))
+        self.round = 1
+        self.best = None
+
+    def throw(self):
+        if self.best is not None:
+            return self.best
+        
+        k = randint(0, len(self.not_played)-1)
+        m = self.not_played.pop(k) 
+        if not self.not_played:
+            self.round += 1
+            self.not_played = list(self.arms) 
+        return m
+
+    def observe(self, move, reward):
+        m = move.item() if isinstance(move, torch.Tensor) else move
+        r = reward.item() if isinstance(reward, torch.Tensor) else reward
+
+        norm_r = (r + 1)/2
+        self.means[m] = (self.round - 1)/(self.round)* self.means[m] \
+                        + norm_r/self.round
+
+        if self.best is not None:
+            if max(self.means) - self.means[self.best] > self.epsilon:
+                self.reset() 
+            return 
+
+        flip = self.coin.sample()
+        if flip.item() == 1:
+            self.reset()
+        #elimination
+        if self.round >= self.thresh:
+            max_mean = max( self.arms, key = lambda i: self.means[i])
+            elim = set()
+            for m in self.arms:
+                if max_mean - self.means[m] + self.epsilon \
+                    >= sqrt(1/(2*self.round) * log( 12*self.round**2/self.delta)):
+                    elim.add(m) 
+            self.arms -= elim 
+            if len(self.arms) == 1:
+                self.best = self.arms.pop()
+
+    def reset(self):
+        self.round = 1
+        self.arms = {0,1,2}
+        self.not_played = [0,1,2]
+        self.means = [0.,0.,0.]
+        self.best = None
+
+class Observation():
+    def __init__(self, move = None, step = 0):
+        self.lastOpponentAction = move
+        self.step = step
+
+
+if __name__ == "__main__":
+    obs = Observation()
+    score = 0
+    while True:
+        m = exp3r_agent(obs, None)
+        print(f"Score:\t {score}")
+        obs.lastOpponentAction = int( input("Your Move:\t"))
+        assert 0 <= obs.lastOpponentAction < 3
+        obs.step += 1
+        result = WIN[ obs.lastOpponentAction, m].item()
+        score += result
