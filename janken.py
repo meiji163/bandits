@@ -1,4 +1,4 @@
-from math import sqrt, log
+from math import sqrt, log, exp
 from random import randint
 from copy import copy
 import torch
@@ -17,7 +17,10 @@ WIN = torch.Tensor([[ 0, -1,  1],
                     [ 1,  0, -1],
                     [-1,  1,  0]])
 
-def expected_reward(dist_1, dist_2):
+def expected_reward(dist_1, dist_2, device = None):
+    global WIN 
+    if device is not None:
+        return dist_1.to(device)@ WIN.to(device)@ dist_2.to(device)
     return dist_1 @ WIN @ dist_2
 
 class JankenRNN(nn.Module):
@@ -29,10 +32,10 @@ class JankenRNN(nn.Module):
         super(JankenRNN, self).__init__()
         self.id = 0  
         self.device = device 
-        self.hidden_size = 128 
+        self.hidden_size = 90 
         self.gru = nn.GRU(3, self.hidden_size,
-                                num_layers = 3, 
-                                dropout = 0.2,
+                                num_layers = 6, 
+                                dropout = 0.3,
                                 batch_first = True)
         self.lin = nn.Linear(self.hidden_size, 3)
         self.softmax = nn.Softmax(dim = 1)
@@ -83,7 +86,7 @@ class dumbJanken():
             self.policy = self.rand_dist()
         
     def __str__(self):
-        return f"dumb: reset_prob = {self.reset.probs.item()}, bias = {self.bias}"
+        return f"dumb: reset_prob = {self.reset.probs.item():.3f}, bias = {self.bias:.3f}"
     def rand_dist(self):
         return Categorical(torch.rand(3))
 
@@ -114,9 +117,9 @@ class exp3rJanken():
         delta (float): probability of failure in drift detection
     '''
     def __init__(self, **kwargs):
-        self.H = kwargs.get("H",360)
-        self.gamma = kwargs.get("gamma", 0.15)
-        self.epsilon = sqrt( (-3*log(0.1))/(2*self.gamma*self.H) )
+        self.H = kwargs.get("H",200)
+        self.gamma = kwargs.get("gamma", 0.1)
+        self.epsilon = 0.5*sqrt( (-3*log(0.1))/(2*self.gamma*self.H))
 
         self.rewards = [0.,0.,0.]
         self.observations = [0,0,0]
@@ -124,21 +127,25 @@ class exp3rJanken():
         self.policy = Categorical(self.weights)
 
     def __str__(self):
-        return f"exp3r: gamma = {self.gamma}, epsilon = {self.epsilon}"
+        return f"exp3r: gamma = {self.gamma:.3f}, epsilon = {self.epsilon:.3f}"
+
     def observe(self, move, reward):
-        reward = (reward + 1)/2.0
-        self.rewards[move] += reward
-        self.observations[move] += 1
-        self.weights[move] *= torch.exp( self.gamma*reward/(3*self.policy.probs[move]) )
-        probs = ((1 - self.gamma)/self.weights.sum())*self.weights\
-                + (self.gamma/3.0)*torch.ones(3) 
-        self.policy = Categorical(probs)
+        norm_r = (reward + 1)/2.0
+        m = move.item()
+        self.rewards[m] += norm_r.item()
+        self.observations[m] += 1
+        prior = self.dist[m].item() 
+        if self.weights[m] < 1e15:
+            self.weights[m] *= exp( self.gamma*norm_r.item()/(100*prior) )
+            probs = ((1 - self.gamma)/self.weights.sum())*self.weights\
+                    + (self.gamma/3.0)*torch.ones(3) 
+            self.policy = Categorical(probs)
 
         #reset if drift is detected 
         if min(self.observations) > self.gamma*self.H/3.0:
             means = [self.rewards[i]/self.observations[i] for i in range(3)]
             prev_means = copy(means)
-            prev_means[move] = (self.rewards[move] - reward)/(self.observations[move] -1)
+            prev_means[move] = (self.rewards[move] - norm_r.item())/(self.observations[move] -1)
             prev_max = max(prev_means)
 
             if any([means[i] - prev_max >= self.epsilon for i in range(3)]):
@@ -147,11 +154,18 @@ class exp3rJanken():
     def reset(self):
         self.weights = torch.ones(3)
         self.policy = Categorical(self.weights)
-        self.rewards = [0,0,0]
+        self.rewards = [0.,0.,0.]
         self.observations = [0,0,0]    
 
     def throw(self):
-        return self.policy.sample()
+        try:
+            return self.policy.sample()
+        except:
+            print("FAILURE")
+            print(self.dist)
+            print(f"observations: {self.observations}")
+            print(f"weights: {self.weights}")
+            print(self.rewards)
 
     @property
     def dist(self):
@@ -170,16 +184,17 @@ class ucbJanken():
         self.rewards = [0.,0.,0.]
     
     def __str__(self):
-        return f"ucb: gamma = {self.gamma}, epsilon = {self.epsilon}"
+        return f"ucb: gamma = {self.gamma:.3f}, epsilon = {self.epsilon:.3f}"
+
     def observe(self, move, reward):
         '''move (torch.tensor)'''
-        self.rewards[move.item()] += reward
+        self.rewards[move.item()] += reward.item()
 
     def ucb(self, m):
         if self.visits[m] == 0:
             return 0 
         return self.rewards[m]/self.visits[m]\
-               + self.gamma*sqrt(log( sum(self.visits) ))/self.visits[m]
+               + self.gamma*sqrt(sum(self.visits))/self.visits[m]
 
     def throw(self):
         if sum(self.visits) == 0:
@@ -200,7 +215,8 @@ class ucbJanken():
         best = max(MOVES, key = self.ucb)
         d = torch.zeros(3)
         d[best] = 1.0
-        d = (1-self.epsilon)*d + (self.epsilon/3)*torch.ones(3)
+        d = (1-self.epsilon)*d + (self.epsilon/3.0)*torch.ones(3)
+        return d
 
 class pucbJanken(ucbJanken):
     '''PUCB algorithm with RNN predictor
@@ -211,8 +227,8 @@ class pucbJanken(ucbJanken):
         self.predictor = predictor
 
     def observe(self, move, reward):
-        self.predictor.observe(move)
-        self.rewards[move.item()] += reward
+        self.predictor.observe(move, reward)
+        self.rewards[move.item()] += reward.item()
 
     def pucb(self, m):
         if self.visits[m] == 0:
@@ -232,3 +248,12 @@ class pucbJanken(ucbJanken):
                 m = max(MOVES, key = self.pucb) 
         self.visits[m] += 1
         return torch.tensor(m)
+
+    @property
+    def dist(self):
+        if sum(self.visits) == 0:
+            return 1/3*torch.ones(3)
+        best = max(MOVES, key = self.pucb)
+        d = torch.zeros(3)
+        d[best] = 1.0
+        d = (1-self.epsilon)*d + (self.epsilon/3)*torch.ones(3)
