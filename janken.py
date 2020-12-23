@@ -25,49 +25,59 @@ def expected_reward(dist_1, dist_2, device = None):
 
 class gruJanken(nn.Module):
     '''A GRU to play Janken. 
-    Input: previous opponent move
+    Input: previous opponent move + previous agent move
     Output: policy distribution
     '''
     def __init__(self, device = None):
         super(gruJanken, self).__init__()
         self.id = 0  
         self.device = device 
-        self.hidden_size = 64 
-        self.gru = nn.GRU(3, self.hidden_size,
-                                num_layers = 8, 
-                                dropout = 0.5,
+        self.hidden_size = 32 
+        self.gru = nn.GRU(6, self.hidden_size,
+                                num_layers = 10, 
+                                dropout = 0.3,
                                 batch_first = True)
         self.lin = nn.Linear(self.hidden_size, 3)
         self.softmax = nn.Softmax(dim = 1)
         self.relu = nn.ReLU()
-
+        
+        self.last_move = None
         self.hidden_state = None
         self.dist = 1/3*torch.ones(3)
 
     def __str__(self):
-        return f"RNN {self.id}"
+        return f"GRU {self.id}"
 
-    def forward(self, inputs, h = None):
-        x = F.one_hot(inputs, 3).float()
+    def forward(self, opp_moves, moves, h = None):
+        batch = moves.shape[0]
+        x = F.one_hot(opp_moves, 3).float()
+        y = F.one_hot(moves, 3).float()
+        inputs = torch.cat((x,y), dim = 1).view(batch, -1, 6)
         if h is None:
-            y, new_h = self.gru(x)
+            out, new_h = self.gru(inputs)
         else:
-            y, new_h = self.gru(x, h)
-        out = self.lin(self.relu(y[:,-1]))
+            out, new_h = self.gru(inputs, h)
+        out = self.lin(self.relu(out[:,-1]))
         return out, new_h
     
     def observe(self, move, reward, device = None):
-        last = ((move - reward)%3).long().unsqueeze(0)
+        last = ((move - reward)%3).long().unsqueeze(0).unsqueeze(0)
+        move = move.unsqueeze(0).unsqueeze(0)
         if device:
             last = last.to(device) 
-        out, h = self.forward(last.unsqueeze(0), self.hidden_state)
+            move = move.to(device)
+        out, h = self.forward(last, move ,self.hidden_state)
         self.hidden_state = h
         self.dist = self.softmax(out).squeeze(0)
  
     def throw(self):
         policy = Categorical(self.dist)
         return policy.sample()
-   
+
+    def reset(self):
+        self.hidden_state = None
+        self.dist = 1/3*torch.ones(3)
+
 class randJanken():
     '''Random janken player chooses a random policy distribution and randomly resets it.
     kwargs:
@@ -76,7 +86,10 @@ class randJanken():
         bias (float): scalar to determine biasing towards moves that previously won'''
     def __init__(self, reset_prob = 0.015, **kwargs):
         #expected reset time = 1/(reset_prob)
-        self.reset = Bernoulli(torch.tensor(reset_prob))
+        if reset_prob == 0:
+            self.coin = None
+        else:
+            self.coin = Bernoulli(torch.tensor(reset_prob))
         self.dists = kwargs.get("dists")
         self.bias = kwargs.get("bias")
 
@@ -86,23 +99,30 @@ class randJanken():
             self.policy = self.rand_dist()
         
     def __str__(self):
-        return f"dumb: reset_prob = {self.reset.probs.item():.3f}, bias = {self.bias:.3f}"
+        if self.coin is None:
+            return "uniform"
+        return f"rand: reset_prob = {self.coin.probs.item():.3f}, bias = {self.bias:.3f}"
     def rand_dist(self):
         return Categorical(torch.rand(3))
 
     def throw(self):
-        r = self.reset.sample().item()
+        r = 0
+        if self.coin is not None:
+            r = self.coin.sample().item()
         if r == 1:
             if self.dists:
                 self.policy = Categorical(dists.pop(0))
             else:
-                self.policy = self.rand_dist()
+                self.reset()
         return self.policy.sample() 
 
     def observe(self, move, reward):
         if reward == 1 and self.bias:
             v = F.one_hot(move, 3)
             self.policy.probs = self.bias*v + (1-self.bias)*self.policy.probs
+    
+    def reset(self):
+        self.policy = self.rand_dist()
 
     @property
     def dist(self):
@@ -174,8 +194,8 @@ class ucbJanken():
     def __init__(self, **kwargs):
         self.gamma = kwargs.get("gamma", 0.5)
         self.epsilon = kwargs.get("epsilon", 0.1)
-        reset_prob = kwargs.get("reset_prob")
-        self.reset = Bernoulli(torch.tensor(reset_prob))
+        reset_prob = kwargs.get("reset_prob", 0.2)
+        self.coin = Bernoulli(torch.tensor(reset_prob))
 
         self.explore = Bernoulli(torch.tensor(self.epsilon))
         self.visits = [0,0,0]
@@ -207,6 +227,10 @@ class ucbJanken():
         self.visits[m] += 1
         return torch.tensor(m)
     
+    def reset(self):
+        self.visits = [0,0,0]
+        self.rewards = [0.,0.,0.]        
+
     @property
     def dist(self):
         if sum(self.visits) == 0:
@@ -261,8 +285,8 @@ class serJanken():
     def __init__(self, **kwargs):
         self.delta = kwargs.get("delta", 0.35)
         self.epsilon = kwargs.get("epsilon", 0.3)
-        reset_prob = kwargs.get("reset_prob", 0.1)
-        self.coin= Bernoulli(torch.tensor( reset_prob))
+        self.reset_prob = kwargs.get("reset_prob", 0.1)
+        self.coin= Bernoulli(torch.tensor( self.reset_prob))
         self.means = [0.,0.,0.] 
         self.arms = {0,1,2}
         self.not_played = [0,1,2]
@@ -271,16 +295,19 @@ class serJanken():
         self.round = 1
         self.best = None
 
+    def __str__(self):
+        return f"ser4: thresh = {self.thresh}, reset_prob = {self.reset_prob}, epsilon = {self.epsilon}"
+
     def throw(self):
         if self.best is not None:
-            return self.best
+            return torch.tensor(self.best)
         
         k = randint(0, len(self.not_played)-1)
         m = self.not_played.pop(k) 
         if not self.not_played:
             self.round += 1
             self.not_played = list(self.arms) 
-        return m
+        return torch.tensor(m)
 
     def observe(self, move, reward):
         m = move.item() if isinstance(move, torch.Tensor) else move
@@ -298,8 +325,11 @@ class serJanken():
         flip = self.coin.sample()
         if flip.item() == 1:
             self.reset()
+            return
         #elimination
         if self.round >= self.thresh:
+            if len(self.arms) == 0:
+                self.reset()
             max_mean = max( self.arms, key = lambda i: self.means[i])
             elim = set()
             for m in self.arms:
@@ -317,17 +347,39 @@ class serJanken():
         self.means = [0.,0.,0.]
         self.best = None
 
+class copyJanken():
+    def __init__(self, epsilon = 0.5):
+        self.epsilon = epsilon
+        self.explore = Bernoulli(torch.tensor(self.epsilon))
+        self.last = None
+
+    def __str__(self):
+        return f"copy: epsilon = {self.epsilon}"
+
+    def reset(self):
+        pass
+    
+    def throw(self):
+        if self.last is None:
+            return torch.tensor(randint(0,2)) 
+        else:
+            return self.last
+
+    def observe(self, move, reward):
+        r = self.explore.sample()
+        if r.item() == 1:
+            return torch.tensor(randint(0,2))
+
 class Observation():
     def __init__(self, move = None, step = 0):
         self.lastOpponentAction = move
         self.step = step
 
-
 if __name__ == "__main__":
     obs = Observation()
     score = 0
     while True:
-        m = exp3r_agent(obs, None)
+        m = (obs, None)
         print(f"Score:\t {score}")
         obs.lastOpponentAction = int( input("Your Move:\t"))
         assert 0 <= obs.lastOpponentAction < 3

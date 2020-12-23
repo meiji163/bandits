@@ -7,47 +7,55 @@ import os
 import torch
 
 def train(bot, bot_op, optimizer, err, **kwargs):
-    interval = kwargs.get("interval", 100)
-    n_it = kwargs.get("n_it", 10)
+    interval = kwargs.get("interval", 50)
+    n_it = kwargs.get("n_it", 50)
     device = kwargs.get("device")    
-    n_games = kwargs.get("n_games", 10)
+    n_games = kwargs.get("n_games", 5)
     
-    for _ in range(n_games):
+    for game in range(n_games):
         rewards = []
+        bot.reset()
+        bot_op.reset()
+
+        hidden_states = []
+        targets = []
+        moves = []
+        opp_moves = []
         for _ in range(n_it):
-            hidden_states = []
-            targets = []
-            seqs = []
             for i in range(interval):
-                seq = []
                 m1 = bot.throw()
                 m2 = bot_op.throw()
                 
-                seq.append(m2.item())
-              
                 reward = WIN[m1,m2]
                 rewards.append(reward.item())
 
                 m1 = m1.to(device)
                 bot.observe(m1, reward)
                 bot_op.observe(m2, -reward)
-            seqs.append(seq)
+                
+                if i == interval -1:
+                    moves.append( m1.item())
+                    opp_moves.append( m2.item())
+
             hidden_states.append( bot.hidden_state)
-            targ = bot_op.throw().item() 
+            targ = (bot_op.throw().item()+1)%3
             targets.append(targ)
         
-        inputs = torch.tensor(seqs).to(device)
-        targets = torch.Tensor(targets).to(device)
+        inputs = (torch.tensor(opp_moves).to(device), torch.tensor(moves).to(device))
+        targets = torch.tensor(targets).to(device)
         hidden_states = torch.cat( hidden_states, dim = 1).to(device)
-        outputs, _ = bot(inputs, hidden_states)
+        outputs, _ = bot(*inputs, hidden_states)
         loss = err( outputs, targets)
 
+        avg_reward = 0.5*(sum(rewards)/len(rewards) +1)
+        loss *= (1- avg_reward) 
         #backpropagate
         optimizer.zero_grad()
-        loss.backward()
+        rg = False if game == n_games -1 else True
+        loss.backward(retain_graph = rg)
         optimizer.step()
 
-        print(f"score: {sum(rewards)}/{len(rewards)}")
+        print(f"score: {sum(rewards):.0f}/{len(rewards)}\t loss: {loss.item()}")
     
 
 if __name__ == "__main__":
@@ -61,7 +69,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda") #torch.device("cuda" if torch.cuda.is_available else "cpu")
  
-    j = JankenRNN(device)
+    j = gruJanken(device)
     j.train()
     j.to(device)
     weight_paths = glob("weights/j_*.pt")
@@ -73,8 +81,9 @@ if __name__ == "__main__":
         print(f"Loading {weight_paths[idx]}")
         j.load_state_dict(weight["model_state_dict"])
         j.id = weight["id"]
-
-    optimizer = torch.optim.AdamW(j.parameters(), lr = 0.01)
+    
+    err = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(j.parameters(), lr = 0.1)
     optim_path = os.path.join( os.getcwd(), "weights", f"adam_w.pt")
     if os.path.exists(optim_path):
         param = torch.load(optim_path, map_location = device)
@@ -86,17 +95,19 @@ if __name__ == "__main__":
                     if torch.is_tensor(t):
                         state[k] = t.cuda()
 
-    games = args.g #number of games to play against each opponent 
     for epoch in range(args.e):
         for _ in range(args.n):
             #choose the opponent and random hyperparameters
-            opps = ["rand", "exp3r", "ser", "ucb", "rnn"]
+            opps = ["rand", "copy", "exp3r", "ucb", "unif"] + 4*["rnn"]
             r = randint(0, len(opps)-1)
 
             if opps[r] == "rand":
-                reset_time = randint(2,30)
-                b = 0.2*torch.rand(1).item()
-                j_op = dumbJanken(bias = b, reset_prob = 1/reset_time)
+                reset_time = randint(2,100)
+                b = 0.4*torch.rand(1).item()
+                j_op = randJanken(bias = b, reset_prob = 1/reset_time)
+
+            elif opps[r] == "unif":
+                j_op = randJanken(bias = 0, reset_prob = 0)
 
             elif opps[r] == "exp3r":
                 exploration = 0.1 + 0.2*torch.rand(1)
@@ -104,23 +115,25 @@ if __name__ == "__main__":
                 j_op = exp3rJanken(gamma = exploration.item(), H = H)
 
             elif opps[r] == "ucb":
+                reset_time = randint(2,30)
                 exploration = 5*torch.rand(1)
                 e = 0.5*torch.rand(1)
                 j_op = ucbJanken(gamma = exploration.item(),
-                                 epsilon = e.item())
+                                 epsilon = e.item(),
+                                 reset_prob = 1/reset_time)
 
-            elif oppps[r] == "ser":
+            elif opps[r] == "ser":
                 reset_time = randint(2,30)
                 epsilon = 0.8*torch.rand(1)
                 delta = 0.5*torch.rand(1) 
-                j_op = serJanker(delta = delta.item(),
+                j_op = serJanken(delta = delta.item(),
                                 reset_prob = 1/reset_time,
                                 epsilon = epsilon.item())
 
             elif opps[r] == "rnn" or opps[r] == "pucb":
                 n = randint(0, len(weight_paths) -1)
                 weights = torch.load(weight_paths[n], map_location = device)
-                p = JankenRNN()
+                p = gruJanken()
                 p.load_state_dict(weights["model_state_dict"])
                 p.id = weights["id"]
                 p.eval()
@@ -129,17 +142,15 @@ if __name__ == "__main__":
                 else:
                     j_op = p
             
-            print(f"\nEpoch {epoch+1} --- playing vs {j_op}")
-            stats = []            
-            for _ in range(games):
-                avg, scores = train(j, j_op, optimizer, device = device)
-                print(f"expected: {100*sum(avg)/len(avg):.2f}\t\t score: {100*sum(scores)/len(scores):.2f}")
-                stats.extend(avg)
-            
-            with open(args.f, 'a') as f:
-                f.write(f"Epoch {epoch + 1} --- {j_op}\n")
-                f.write(",".join([format(x, '.3f') for x in stats]) + '\n')  
+            elif opps[r] == "copy":
+                epsilon = 0.2 + 0.8*torch.rand(1)
+                j_op = copyJanken(epsilon = epsilon.item())
 
+            print(f"\nEpoch {epoch+1} --- playing vs {j_op}")
+            train(j, j_op, optimizer, err, 
+                            device = device,
+                            n_games = args.g)
+            
         j.id += 1
         out_path = os.path.join( os.getcwd(), "weights", f"j_{j.id}.pt")
         weight_paths.append(out_path)
