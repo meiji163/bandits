@@ -17,11 +17,80 @@ WIN = torch.Tensor([[ 0, -1,  1],
                     [ 1,  0, -1],
                     [-1,  1,  0]])
 
+BASIS = 1/6*WIN @ WIN
+UNIFORM = 1/3*torch.ones(3)
+
 def expected_reward(dist_1, dist_2, device = None):
     global WIN 
     if device is not None:
         return dist_1.to(device)@ WIN.to(device)@ dist_2.to(device)
     return dist_1 @ WIN @ dist_2
+
+def counter_policy(dist, device = None):
+    global WIN
+    global BASIS
+    global UNIFORM
+    if device is not None:
+        WIN = WIN.to(device)
+        BASIS = BASIS.to(device)
+        UNIFORM = UNIFORM.to(device)
+    q = WIN @ dist
+    i = (torch.argmax(q) + 1)%3    
+    n = WIN[i]
+    counter = (q @ n)/(n @ n)*n + BASIS[i] + UNIFORM
+    return torch.abs(counter)
+
+class lstmJanken(nn.Module):
+    def __init__(self):
+        super(lstmJanken, self).__init__()
+    
+        self.id = 0
+        self.hidden_size = 32
+        self.lstm = nn.LSTM(9, self.hidden_size,
+                                num_layers = 3,
+                                bias = False,
+                                batch_first = True,
+                                dropout = 0.1)
+        self.lin = nn.Linear(self.hidden_size, 3)
+        self.hidden_state = None
+        self.softmax = nn.Softmax(dim = 1)
+        self.dist = 1/3*torch.ones(3)
+     
+    def forward(self, inputs, state = None):
+        if state is None:
+            y, new_state = self.lstm(inputs)
+        else:
+            y, new_state = self.lstm(inputs)
+        out = self.lin(y[:,-1])
+        return out, new_state 
+
+    def throw(self):
+        policy = Categorical(self.dist)
+        return policy.sample()
+
+    def observe(self, move, reward, device = None):
+        opp_move = ((move - reward)%3).unsqueeze(0)
+        move = move.unsqueeze(0)
+        if device:
+            move = move.to(device)
+            last = last.to(device)
+        inputs = self.encode(opp_move, move)
+    
+        out, h = self.forward(inputs, self.hidden_state)
+        self.hidden_state = h
+        self.dist = counter_policy(self.softmax(out).squeeze(0))
+    
+    def encode(self, opp_moves, moves):
+        x = opp_moves + 3*moves
+        encoded = F.one_hot(x.long(), 9).float()
+        if encoded.dim() == 2:
+            return encoded.unsqueeze(0)
+        return encoded
+
+    def reset(self):
+        self.hidden_state = None
+        self.dist = 1/3*torch.ones(3)
+        
 
 class gruJanken(nn.Module):
     '''A GRU to play Janken. 
@@ -34,25 +103,22 @@ class gruJanken(nn.Module):
         self.device = device 
         self.hidden_size = 32 
         self.gru = nn.GRU(6, self.hidden_size,
-                                num_layers = 10, 
-                                dropout = 0.3,
+                                num_layers = 5, 
+                                dropout = 0.2,
                                 batch_first = True)
         self.lin = nn.Linear(self.hidden_size, 3)
         self.softmax = nn.Softmax(dim = 1)
         self.relu = nn.ReLU()
         
-        self.last_move = None
         self.hidden_state = None
         self.dist = 1/3*torch.ones(3)
 
     def __str__(self):
         return f"GRU {self.id}"
 
-    def forward(self, opp_moves, moves, h = None):
+    def forward(self, inputs, h = None):
         batch = moves.shape[0]
-        x = F.one_hot(opp_moves, 3).float()
-        y = F.one_hot(moves, 3).float()
-        inputs = torch.cat((x,y), dim = 1).view(batch, -1, 6)
+        x = F.one_hot(inputs, 3).float()
         if h is None:
             out, new_h = self.gru(inputs)
         else:
@@ -64,9 +130,8 @@ class gruJanken(nn.Module):
         last = ((move - reward)%3).long().unsqueeze(0).unsqueeze(0)
         move = move.unsqueeze(0).unsqueeze(0)
         if device:
-            last = last.to(device) 
             move = move.to(device)
-        out, h = self.forward(last, move ,self.hidden_state)
+        out, h = self.forward(move ,self.hidden_state)
         self.hidden_state = h
         self.dist = self.softmax(out).squeeze(0)
  
@@ -301,12 +366,11 @@ class serJanken():
     def throw(self):
         if self.best is not None:
             return torch.tensor(self.best)
-        
-        k = randint(0, len(self.not_played)-1)
-        m = self.not_played.pop(k) 
         if not self.not_played:
             self.round += 1
             self.not_played = list(self.arms) 
+        k = randint(0, len(self.not_played)-1)
+        m = self.not_played.pop(k) 
         return torch.tensor(m)
 
     def observe(self, move, reward):
@@ -376,13 +440,18 @@ class Observation():
         self.step = step
 
 if __name__ == "__main__":
-    obs = Observation()
+    j = gruJanken()
+    j.eval()
+    w = torch.load( "weights/j_4.pt", map_location = torch.device("cpu"))
+    j.load_state_dict(w["model_state_dict"])
     score = 0
-    while True:
-        m = (obs, None)
-        print(f"Score:\t {score}")
-        obs.lastOpponentAction = int( input("Your Move:\t"))
-        assert 0 <= obs.lastOpponentAction < 3
-        obs.step += 1
-        result = WIN[ obs.lastOpponentAction, m].item()
-        score += result
+    while(True):
+        print(f"Score:\t{score}")
+        i = int(input("Your Move:\t"))
+        m = j.throw()
+        print(m.item())
+        r = WIN[m,i]
+        j.observe(m, r)
+        print(j.dist)
+        score -= r.item()
+         
