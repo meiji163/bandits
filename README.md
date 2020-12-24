@@ -20,8 +20,11 @@ EXP3.R (EXP3 with Resets)<sup>3 4</sup>
 * lots of hyperparameters to tune
 
 ## References
-1 https://link.springer.com/article/10.1023/A:1013689704352
-2 https://link.springer.com/article/10.1007%2Fs10472-011-9258-6
-3 https://link.springer.com/article/10.1007/s41060-017-0050-5
-4 https://cseweb.ucsd.edu/~yfreund/papers/bandits.pdf
+1: https://link.springer.com/article/10.1023/A:1013689704352</n>
+
+2: https://link.springer.com/article/10.1007%2Fs10472-011-9258-6</n>
+
+3: https://link.springer.com/article/10.1007/s41060-017-0050-5</n>
+
+4: https://cseweb.ucsd.edu/~yfreund/papers/bandits.pdf
 
