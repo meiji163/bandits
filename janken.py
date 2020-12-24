@@ -1,6 +1,7 @@
 from math import sqrt, log, exp
-from random import randint
+from random import randint, choice
 from copy import copy
+import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,6 +35,7 @@ def counter_policy(dist, device = None):
         WIN = WIN.to(device)
         BASIS = BASIS.to(device)
         UNIFORM = UNIFORM.to(device)
+
     q = WIN @ dist
     i = (torch.argmax(q) + 1)%3    
     n = WIN[i]
@@ -55,6 +57,9 @@ class lstmJanken(nn.Module):
         self.hidden_state = None
         self.softmax = nn.Softmax(dim = 1)
         self.dist = 1/3*torch.ones(3)
+
+    def __str__(self):
+        return f"LSTM: {self.id}"
      
     def forward(self, inputs, state = None):
         if state is None:
@@ -71,16 +76,16 @@ class lstmJanken(nn.Module):
     def observe(self, move, reward, device = None):
         opp_move = ((move - reward)%3).unsqueeze(0)
         move = move.unsqueeze(0)
-        if device:
-            move = move.to(device)
-            last = last.to(device)
-        inputs = self.encode(opp_move, move)
+        inputs = self.encode(opp_move, move, device)
     
         out, h = self.forward(inputs, self.hidden_state)
         self.hidden_state = h
-        self.dist = counter_policy(self.softmax(out).squeeze(0))
+        self.dist = counter_policy(self.softmax(out).squeeze(0), device)
     
-    def encode(self, opp_moves, moves):
+    def encode(self, opp_moves, moves, device = None):
+        if device is not None:
+            moves = moves.to(device)
+            opp_moves = opp_moves.to(device)
         x = opp_moves + 3*moves
         encoded = F.one_hot(x.long(), 9).float()
         if encoded.dim() == 2:
@@ -259,8 +264,8 @@ class ucbJanken():
     def __init__(self, **kwargs):
         self.gamma = kwargs.get("gamma", 0.5)
         self.epsilon = kwargs.get("epsilon", 0.1)
-        reset_prob = kwargs.get("reset_prob", 0.2)
-        self.coin = Bernoulli(torch.tensor(reset_prob))
+        self.reset_prob = kwargs.get("reset_prob", 0.2)
+        self.coin = Bernoulli(torch.tensor(self.reset_prob))
 
         self.explore = Bernoulli(torch.tensor(self.epsilon))
         self.visits = [0,0,0]
@@ -272,6 +277,9 @@ class ucbJanken():
     def observe(self, move, reward):
         m = move.item() if isinstance(move, torch.Tensor) else move
         r = reward.item() if isinstance(reward, torch.Tensor) else reward
+        flip = self.coin.sample()
+        if flip.item() == 1:
+            self.reset()
         self.rewards[move.item()] += reward.item()
 
     def ucb(self, m):
@@ -309,13 +317,22 @@ class ucbJanken():
 class pucbJanken(ucbJanken):
     '''PUCB algorithm with RNN predictor
     args:
-        predictor (JankenRNN)'''
+        predictor (gruJanken or lstmJanken)'''
     def __init__(self, predictor, **kwargs):
         super(pucbJanken, self).__init__(**kwargs)
         self.predictor = predictor
 
-    def observe(self, move, reward):
-        self.predictor.observe(move, reward)
+    def __str__(self):
+        return f"pucb: {self.predictor.id}, gamma = {self.gamma:.3f}, reset_prob = {self.reset_prob:.3f}"
+
+    def observe(self, move, reward, device = None):
+        m = move.item() if isinstance(move, torch.Tensor) else move
+        r = reward.item() if isinstance(reward, torch.Tensor) else reward
+        flip = self.coin.sample()
+        if flip.item() == 1:
+            self.reset()
+
+        self.predictor.observe(move, reward, device)
         self.rewards[move.item()] += reward.item()
 
     def pucb(self, m):
@@ -361,16 +378,16 @@ class serJanken():
         self.best = None
 
     def __str__(self):
-        return f"ser4: thresh = {self.thresh}, reset_prob = {self.reset_prob}, epsilon = {self.epsilon}"
+        return f"ser4: thresh = {self.thresh}, reset_prob = {self.reset_prob:.3f}, epsilon = {self.epsilon:.3f}"
 
     def throw(self):
         if self.best is not None:
             return torch.tensor(self.best)
+        k = randint(0, len(self.not_played) - 1) 
+        m = self.not_played.pop(k) 
         if not self.not_played:
             self.round += 1
             self.not_played = list(self.arms) 
-        k = randint(0, len(self.not_played)-1)
-        m = self.not_played.pop(k) 
         return torch.tensor(m)
 
     def observe(self, move, reward):
@@ -418,7 +435,7 @@ class copyJanken():
         self.last = None
 
     def __str__(self):
-        return f"copy: epsilon = {self.epsilon}"
+        return f"copy: epsilon = {self.epsilon:.3f}"
 
     def reset(self):
         pass
@@ -433,6 +450,30 @@ class copyJanken():
         r = self.explore.sample()
         if r.item() == 1:
             return torch.tensor(randint(0,2))
+
+class constJanken():
+    def __init__(self, reset_prob = 0.5):
+        if isinstance(reset_prob, torch.Tensor):
+            self.coin = Bernoulli(reset_prob)
+            self.reset_prob = reset_prob.item()
+        else:
+            self.reset_prob = reset_prob
+            self.coin = Bernoulli(torch.tensor(reset_prob)) 
+        self.move = randint(0,2)
+
+    def __str__(self):
+        return f"const: reset_prob = {self.reset_prob}"
+    
+    def throw(self):
+        return torch.tensor(self.move)
+
+    def observe(self,move, reward):
+        r = self.coin.sample()
+        if r.item() == 1:
+            self.reset()
+
+    def reset(self):
+        self.move = randint(0,2)
 
 class Observation():
     def __init__(self, move = None, step = 0):

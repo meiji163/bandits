@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 import argparse
 from janken import *
-from random import randint
+from random import randint, choice, uniform
 from glob import glob
 import os
 import torch
 
 def train(bot, bot_op, optimizer, err, **kwargs):
-    interval = kwargs.get("interval", 100)
-    n_it = kwargs.get("n_it", 10)
+    interval = kwargs.get("interval", 50)
+    n_it = kwargs.get("n_it", 32)
     device = kwargs.get("device")    
     n_games = kwargs.get("n_games", 5)
     stats = kwargs.get("stats")
-    
+  
     for game in range(n_games):
         rewards = []
         hidden_states = []
+        cell_states = []
+
         targets = []
         moves = []
         opp_moves = []
@@ -27,24 +29,30 @@ def train(bot, bot_op, optimizer, err, **kwargs):
                 reward = WIN[m1,m2]
                 rewards.append(reward.item())
 
-                m1 = m1.to(device)
-                bot.observe(m1, reward)
-                bot_op.observe(m2, -reward)
+                bot.observe(m1, reward, device)
+                if isinstance(bot_op, lstmJanken) or isinstance(bot_op, pucbJanken):
+                    bot_op.observe(m2, reward, device)
+                else:
+                    bot_op.observe(m2, -reward)
                 
                 if i == interval -1:
-                    moves.append( m1.item())
-                    opp_moves.append( m2.item())
+                    moves.append( m1.unsqueeze(0))
+                    opp_moves.append( m2.unsqueeze(0))
 
-            hidden_states.append( bot.hidden_state)
+            hidden_states.append( bot.hidden_state[0])
+            cell_states.append( bot.hidden_state[1])
             targ = bot_op.throw().item()
             targets.append(targ)
         
-        inputs = (torch.tensor(opp_moves).to(device), torch.tensor(moves).to(device))
+        inputs = (torch.tensor(opp_moves).unsqueeze(0).T,
+                 torch.tensor(moves).unsqueeze(0).T)
         targets = torch.tensor(targets).to(device)
         hidden_states = torch.cat( hidden_states, dim = 1).to(device)
-        outputs, _ = bot(*inputs, hidden_states)
+        cell_states = torch.cat( cell_states, dim = 1).to(device)
+        encoded = bot.encode(*inputs, device)
+        outputs, _ = bot(encoded, (hidden_states, cell_states))
         loss = err(outputs, targets)
-
+        
         avg_reward = 0.5*(sum(rewards)/len(rewards) +1)
         loss *= (1- avg_reward) 
         #backpropagate
@@ -67,16 +75,23 @@ if __name__ == "__main__":
 
     device = torch.device("cuda") #torch.device("cuda" if torch.cuda.is_available else "cpu")
  
-    j = gruJanken(device)
+    j = lstmJanken()
     j.train()
     j.to(device)
     weight_paths = glob("weights/j_*.pt")
+    
+
     if len(weight_paths) == 0:
         torch.save( {"model_state_dict": j.state_dict(), "id": 0}, os.path.join("weights", "j_0.pt"))
     else:
-        idx = max(range( len(weight_paths)), key = lambda x: int(weight_paths[x][-4]))
-        weight = torch.load( weight_paths[idx], map_location = device)
-        print(f"Loading {weight_paths[idx]}")
+        
+        def get_id(path):
+            match = re.match(r"weights/j_(\d+).pt", path)
+            return int(match[1])
+
+        latest = max(weight_paths, key = get_id) 
+        weight = torch.load( latest, map_location = device)
+        print(f"Loading {latest}")
         j.load_state_dict(weight["model_state_dict"])
         j.id = weight["id"]
     
@@ -96,56 +111,67 @@ if __name__ == "__main__":
     for epoch in range(args.e):
         for _ in range(args.n):
             #choose the opponent and random hyperparameters
-            opps = ["rand", "copy", "exp3r", "ucb", "unif"] + 4*["rnn"]
-            r = randint(0, len(opps)-1)
+            opps = ["const","rand", "copy", "exp3r", "ucb", "unif", "ser"]+ 3*["pucb","rnn"]
+            opp = choice(opps) 
 
-            if opps[r] == "rand":
+            if opp == "rand":
                 reset_time = randint(2,100)
                 b = 0.8*torch.rand(1).item()
                 j_op = randJanken(bias = b, reset_prob = 1/reset_time)
 
-            elif opps[r] == "unif":
+            elif opp == "const":
+                prob = torch.rand(1) 
+                j_op = constJanken(reset_prob = prob) 
+
+            elif opp == "unif":
                 j_op = randJanken(bias = 0, reset_prob = 0)
 
-            elif opps[r] == "exp3r":
-                exploration = 0.1 + 0.2*torch.rand(1)
+            elif opp == "exp3r":
+                exploration = uniform(0.1, 0.4)
                 H = randint(100,300)
-                j_op = exp3rJanken(gamma = exploration.item(), H = H)
+                j_op = exp3rJanken(gamma = exploration, H = H)
 
-            elif opps[r] == "ucb":
+            elif opp == "ucb":
                 reset_time = randint(2,30)
-                exploration = 5*torch.rand(1)
-                e = 0.5*torch.rand(1)
-                j_op = ucbJanken(gamma = exploration.item(),
-                                 epsilon = e.item(),
+                exploration = uniform(0,4) 
+                e = uniform(0, 0.6) 
+                j_op = ucbJanken(gamma = exploration,
+                                 epsilon = e,
                                  reset_prob = 1/reset_time)
 
-            elif opps[r] == "ser":
-                reset_time = randint(2,30)
-                e = 0.8*torch.rand(1)
-                delta = 0.5*torch.rand(1) 
-                j_op = serJanken(delta = delta.item(),
-                                reset_prob = 1/reset_time,
-                                epsilon = e.item())
+            elif opp == "ser":
+                prob = uniform(0,1) 
+                e = uniform(0.2,0.8) 
+                delta = uniform(0, 0.5) 
+                j_op = serJanken(delta = delta,
+                                reset_prob = prob, 
+                                epsilon = e)
 
-            elif opps[r] == "rnn" or opps[r] == "pucb":
-                n = randint(0, len(weight_paths) -1)
-                weights = torch.load(weight_paths[n], map_location = device)
-                p = gruJanken()
+            elif opp == "rnn" or opp == "pucb":
+                opp_weight = choice(weight_paths)
+                weights = torch.load(opp_weight, map_location = device)
+                p = lstmJanken()
                 p.load_state_dict(weights["model_state_dict"])
                 p.id = weights["id"]
+                p.to(device)
                 p.eval()
-                if opps[r] == "pucb":
-                    j_op = pucbJanken(p)
+                if opp == "pucb":
+                    prob = uniform(0.2,1)
+                    exploration = uniform(0,4)
+                    e = uniform(0,0.5)
+                    j_op = pucbJanken(p, gamma = exploration,
+                                 epsilon = e,
+                                 reset_prob = prob) 
                 else:
                     j_op = p
             
-            elif opps[r] == "copy":
-                epsilon = 0.2 + 0.8*torch.rand(1)
-                j_op = copyJanken(epsilon = epsilon.item())
+            elif opp == "copy":
+                e = uniform(0.2,1) 
+                j_op = copyJanken(epsilon = e)
 
             print(f"\nEpoch {epoch+1} --- playing vs {j_op}")
             stats = []
+            j.reset()
             train(j, j_op, optimizer, err, 
                             device = device,
                             n_games = args.g,
