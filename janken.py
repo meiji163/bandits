@@ -96,7 +96,6 @@ class lstmJanken(nn.Module):
         self.hidden_state = None
         self.dist = 1/3*torch.ones(3)
         
-
 class gruJanken(nn.Module):
     '''A GRU to play Janken. 
     Input: previous opponent move + previous agent move
@@ -481,9 +480,9 @@ class Observation():
         self.step = step
 
 if __name__ == "__main__":
-    j = gruJanken()
+    j = lstmJanken()
     j.eval()
-    w = torch.load( "weights/j_4.pt", map_location = torch.device("cpu"))
+    w = torch.load("weights/j_32.pt", map_location = torch.device("cpu"))
     j.load_state_dict(w["model_state_dict"])
     score = 0
     while(True):
