@@ -7,16 +7,17 @@ import os
 import torch
 
 def train(bot, bot_op, optimizer, err, **kwargs):
-    interval = kwargs.get("interval", 50)
-    n_it = kwargs.get("n_it", 32)
+    interval = kwargs.get("interval", 10)
+    n_it = kwargs.get("n_it", 128)
     device = kwargs.get("device")    
     n_games = kwargs.get("n_games", 5)
     stats = kwargs.get("stats")
   
     for game in range(n_games):
+        bot.reset()
+        bot_op.reset()
         rewards = []
         hidden_states = []
-        cell_states = []
 
         targets = []
         moves = []
@@ -27,34 +28,30 @@ def train(bot, bot_op, optimizer, err, **kwargs):
                 m2 = bot_op.throw()
                 
                 reward = WIN[m1,m2]
-                rewards.append(reward.item())
-
                 bot.observe(m1, reward, device)
-                if isinstance(bot_op, lstmJanken) or isinstance(bot_op, pucbJanken):
+                if isinstance(bot_op, rnnJanken) or isinstance(bot_op, pucbJanken):
                     bot_op.observe(m2, reward, device)
                 else:
                     bot_op.observe(m2, -reward)
                 
-                if i == interval -1:
+                rewards.append(reward.item() - max_reward(bot_op.dist).item())
+                if i == interval-1:
                     moves.append( m1.unsqueeze(0))
                     opp_moves.append( m2.unsqueeze(0))
-
-            hidden_states.append( bot.hidden_state[0])
-            cell_states.append( bot.hidden_state[1])
-            targ = bot_op.throw().item()
-            targets.append(targ)
+                    hidden_states.append( bot.hidden_state)
+                    targ = bot_op.throw().item()
+                    targets.append(targ)
         
         inputs = (torch.tensor(opp_moves).unsqueeze(0).T,
                  torch.tensor(moves).unsqueeze(0).T)
         targets = torch.tensor(targets).to(device)
         hidden_states = torch.cat( hidden_states, dim = 1).to(device)
-        cell_states = torch.cat( cell_states, dim = 1).to(device)
         encoded = bot.encode(*inputs, device)
-        outputs, _ = bot(encoded, (hidden_states, cell_states))
+        outputs, _ = bot(encoded, hidden_states)
         loss = err(outputs, targets)
         
-        avg_reward = 0.5*(sum(rewards)/len(rewards) +1)
-        loss *= (1- avg_reward) 
+        avg_reward = sum(rewards)/len(rewards)
+        loss *= -(avg_reward 
         #backpropagate
         optimizer.zero_grad()
         loss.backward(retain_graph = False if game == n_games -1 else True)
@@ -62,7 +59,7 @@ def train(bot, bot_op, optimizer, err, **kwargs):
         if stats is not None:
             stats.append(avg_reward)
 
-        print(f"score: {sum(rewards):.0f}/{len(rewards)}\t loss: {loss.item()}")
+        print(f"{sum(rewards):.0f}/{len(rewards)}\t loss: {loss.item():.3f}")
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = "training script for Janken bot")
@@ -79,7 +76,6 @@ if __name__ == "__main__":
     j.train()
     j.to(device)
     weight_paths = glob("weights/j_*.pt")
-    
 
     if len(weight_paths) == 0:
         torch.save( {"model_state_dict": j.state_dict(), "id": 0}, os.path.join("weights", "j_0.pt"))
@@ -96,7 +92,7 @@ if __name__ == "__main__":
         j.id = weight["id"]
     
     err = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(j.parameters(), lr = 0.1)
+    optimizer = torch.optim.AdamW(j.parameters(), lr = 1.0)
     optim_path = os.path.join( os.getcwd(), "weights", f"adam_w.pt")
     if os.path.exists(optim_path):
         param = torch.load(optim_path, map_location = device)
@@ -111,7 +107,7 @@ if __name__ == "__main__":
     for epoch in range(args.e):
         for _ in range(args.n):
             #choose the opponent and random hyperparameters
-            opps = ["const","rand", "copy", "exp3r", "ucb", "unif", "ser"]+ 3*["pucb","rnn"]
+            opps = ["const", "rand", "copy", "exp3r", "ucb", "unif", "ser"]+ 3*["pucb","rnn"]
             opp = choice(opps) 
 
             if opp == "rand":
@@ -168,6 +164,11 @@ if __name__ == "__main__":
             elif opp == "copy":
                 e = uniform(0.2,1) 
                 j_op = copyJanken(epsilon = e)
+        
+            elif opp == "bayes":
+                prob = uniform(0,0.6)
+                j_op = bayesJanken(reset_prob = prob)
+
 
             print(f"\nEpoch {epoch+1} --- playing vs {j_op}")
             stats = []

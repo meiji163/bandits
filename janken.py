@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 from torch.distributions.bernoulli import Bernoulli
+from torch.distributions.beta import Beta
 
 CHOKI = 0
 GUU = 1
@@ -18,7 +19,7 @@ WIN = torch.Tensor([[ 0, -1,  1],
                     [ 1,  0, -1],
                     [-1,  1,  0]])
 
-BASIS = 1/6*WIN @ WIN
+NORMALS = 1/6*WIN @ WIN
 UNIFORM = 1/3*torch.ones(3)
 
 def expected_reward(dist_1, dist_2, device = None):
@@ -27,7 +28,7 @@ def expected_reward(dist_1, dist_2, device = None):
         return dist_1.to(device)@ WIN.to(device)@ dist_2.to(device)
     return dist_1 @ WIN @ dist_2
 
-def counter_policy(dist, device = None):
+def counter_policy(dist, epislon = 0.25, device = None):
     global WIN
     global BASIS
     global UNIFORM
@@ -37,35 +38,49 @@ def counter_policy(dist, device = None):
         UNIFORM = UNIFORM.to(device)
 
     q = WIN @ dist
-    i = (torch.argmax(q) + 1)%3    
+    i = (torch.argmax(q) - 1)%3    
     n = WIN[i]
-    counter = (q @ n)/(n @ n)*n + BASIS[i] + UNIFORM
-    return torch.abs(counter)
+    counter = (q @ n)/(n @ n)*n + NORMALS[i] + UNIFORM
+    return epislon*UNIFORM + (1-epislon)*counter
 
-class lstmJanken(nn.Module):
-    def __init__(self):
-        super(lstmJanken, self).__init__()
+def max_reward(dist, device = None):
+    return expected_reward(counter_policy(dist), dist, device)
+
+class rnnJanken(nn.Module):
+    def __init__(self, model_type = "GRU"):
+        super(rnnJanken, self).__init__()
     
         self.id = 0
         self.hidden_size = 32
-        self.lstm = nn.LSTM(9, self.hidden_size,
-                                num_layers = 3,
-                                bias = False,
-                                batch_first = True,
-                                dropout = 0.1)
+        self.model_type = model_type
+        if model_type == "GRU":
+            self.rnn = nn.GRU(9, self.hidden_size,
+                                    num_layers = 4, 
+                                    dropout = 0.1,
+                                    bias = False,
+                                    batch_first = True)
+        elif model_type == "LSTM":
+            self.rnn = nn.LSTM(9, self.hidden_size,
+                                    num_layers = 3,
+                                    bias = False,
+                                    batch_first = True,
+                                    dropout = 0.1)
+        else:
+            raise ValueError("model_type must be `GRU` or `LSTM`")
+
         self.lin = nn.Linear(self.hidden_size, 3)
         self.hidden_state = None
         self.softmax = nn.Softmax(dim = 1)
-        self.dist = 1/3*torch.ones(3)
-
+        self.dist = UNIFORM
+ 
     def __str__(self):
-        return f"LSTM: {self.id}"
+        return f"{self.model_type}: {self.id}"
      
     def forward(self, inputs, state = None):
         if state is None:
-            y, new_state = self.lstm(inputs)
+            y, new_state = self.rnn(inputs)
         else:
-            y, new_state = self.lstm(inputs)
+            y, new_state = self.rnn(inputs)
         out = self.lin(y[:,-1])
         return out, new_state 
 
@@ -94,58 +109,7 @@ class lstmJanken(nn.Module):
 
     def reset(self):
         self.hidden_state = None
-        self.dist = 1/3*torch.ones(3)
-        
-class gruJanken(nn.Module):
-    '''A GRU to play Janken. 
-    Input: previous opponent move + previous agent move
-    Output: policy distribution
-    '''
-    def __init__(self, device = None):
-        super(gruJanken, self).__init__()
-        self.id = 0  
-        self.device = device 
-        self.hidden_size = 32 
-        self.gru = nn.GRU(6, self.hidden_size,
-                                num_layers = 5, 
-                                dropout = 0.2,
-                                batch_first = True)
-        self.lin = nn.Linear(self.hidden_size, 3)
-        self.softmax = nn.Softmax(dim = 1)
-        self.relu = nn.ReLU()
-        
-        self.hidden_state = None
-        self.dist = 1/3*torch.ones(3)
-
-    def __str__(self):
-        return f"GRU {self.id}"
-
-    def forward(self, inputs, h = None):
-        batch = moves.shape[0]
-        x = F.one_hot(inputs, 3).float()
-        if h is None:
-            out, new_h = self.gru(inputs)
-        else:
-            out, new_h = self.gru(inputs, h)
-        out = self.lin(self.relu(out[:,-1]))
-        return out, new_h
-    
-    def observe(self, move, reward, device = None):
-        last = ((move - reward)%3).long().unsqueeze(0).unsqueeze(0)
-        move = move.unsqueeze(0).unsqueeze(0)
-        if device:
-            move = move.to(device)
-        out, h = self.forward(move ,self.hidden_state)
-        self.hidden_state = h
-        self.dist = self.softmax(out).squeeze(0)
- 
-    def throw(self):
-        policy = Categorical(self.dist)
-        return policy.sample()
-
-    def reset(self):
-        self.hidden_state = None
-        self.dist = 1/3*torch.ones(3)
+        self.dist = UNIFORM 
 
 class randJanken():
     '''Random janken player chooses a random policy distribution and randomly resets it.
@@ -426,6 +390,15 @@ class serJanken():
         self.not_played = [0,1,2]
         self.means = [0.,0.,0.]
         self.best = None
+    
+    @property
+    def dist(self):
+        if self.best is None:
+            return UNIFORM
+        else:
+            d = torch.zeros(3)
+            d[self.best] = 1
+            return d
 
 class copyJanken():
     def __init__(self, epsilon = 0.5):
@@ -450,6 +423,12 @@ class copyJanken():
         if r.item() == 1:
             return torch.tensor(randint(0,2))
 
+    @property
+    def dist(self):
+        d = torch.zeros(3)
+        d[self.last] = 1
+        return d
+
 class constJanken():
     def __init__(self, reset_prob = 0.5):
         if isinstance(reset_prob, torch.Tensor):
@@ -473,6 +452,32 @@ class constJanken():
 
     def reset(self):
         self.move = randint(0,2)
+
+class bayesJanken():
+    def __init__(self, **kwargs):
+        self.reset_prob = kwargs.get("reset_prob", 0.05)
+        self.coin = Bernoulli( torch.tensor(self.reset_prob)) 
+        self.rewards = Beta(torch.ones(3), torch.ones(3))
+        
+    def observe(self, move, reward):
+        flip = self.coin.sample()
+        if flip.item() == 1:
+            self.reset()
+
+        if reward == 1:
+            self.rewards.concentration1[move] += reward
+        else:
+            self.rewards.concentration2[move] -= reward
+    
+    def __str__(self):
+        return f"bayes: reset_prob = {self.reset_prob}"
+
+    def reset(self):
+        self.rewards = Beta( torch.ones(3), torch.ones(3))
+       
+    def throw(self):
+        dist = self.rewards.sample()
+        return torch.argmax(dist) 
 
 class Observation():
     def __init__(self, move = None, step = 0):
