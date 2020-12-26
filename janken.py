@@ -19,7 +19,6 @@ WIN = torch.Tensor([[ 0, -1,  1],
                     [ 1,  0, -1],
                     [-1,  1,  0]])
 
-NORMALS = 1/6*WIN @ WIN
 UNIFORM = 1/3*torch.ones(3)
 
 def expected_reward(dist_1, dist_2, device = None):
@@ -40,7 +39,8 @@ def counter_policy(dist, epislon = 0.25, device = None):
     q = WIN @ dist
     i = (torch.argmax(q) - 1)%3    
     n = WIN[i]
-    counter = (q @ n)/(n @ n)*n + NORMALS[i] + UNIFORM
+    norms = 1/6*WIN @ WIN
+    counter = (q @ n)/(n @ n)*n + norms[i] + UNIFORM
     return epislon*UNIFORM + (1-epislon)*counter
 
 def max_reward(dist, device = None):
