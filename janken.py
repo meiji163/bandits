@@ -27,35 +27,30 @@ def expected_reward(dist_1, dist_2, device = None):
         return dist_1.to(device)@ WIN.to(device)@ dist_2.to(device)
     return dist_1 @ WIN @ dist_2
 
-def counter_policy(dist, epislon = 0.25, device = None):
+def counter_policy(dist, epsilon = 0.25, device = torch.device("cpu")):
     global WIN
-    global BASIS
     global UNIFORM
-    if device is not None:
-        WIN = WIN.to(device)
-        BASIS = BASIS.to(device)
-        UNIFORM = UNIFORM.to(device)
 
-    q = WIN @ dist
+    q = WIN.to(device) @ dist.to(device)
     i = (torch.argmax(q) - 1)%3    
-    n = WIN[i]
+    n = WIN[i].to(device)
     norms = 1/6*WIN @ WIN
-    counter = (q @ n)/(n @ n)*n + norms[i] + UNIFORM
-    return epislon*UNIFORM + (1-epislon)*counter
+    counter = (q @ n)/(n @ n)*n + norms[i].to(device) + UNIFORM.to(device)
+    return torch.abs(epsilon*UNIFORM + (1-epsilon)*counter)
 
-def max_reward(dist, device = None):
-    return expected_reward(counter_policy(dist), dist, device)
+def optim_reward(dist, device = None):
+    return expected_reward(counter_policy(dist, 0.25), dist, device)
 
 class rnnJanken(nn.Module):
-    def __init__(self, model_type = "GRU"):
+    def __init__(self, model_type = "GRU", epsilon = 0.1):
         super(rnnJanken, self).__init__()
-    
+        self.epsilon = epsilon
         self.id = 0
         self.hidden_size = 32
         self.model_type = model_type
         if model_type == "GRU":
             self.rnn = nn.GRU(9, self.hidden_size,
-                                    num_layers = 4, 
+                                    num_layers = 5, 
                                     dropout = 0.1,
                                     bias = False,
                                     batch_first = True)
@@ -71,6 +66,7 @@ class rnnJanken(nn.Module):
         self.lin = nn.Linear(self.hidden_size, 3)
         self.hidden_state = None
         self.softmax = nn.Softmax(dim = 1)
+        self.opp_dist = UNIFORM
         self.dist = UNIFORM
  
     def __str__(self):
@@ -85,7 +81,7 @@ class rnnJanken(nn.Module):
         return out, new_state 
 
     def throw(self):
-        policy = Categorical(self.dist)
+        policy = Categorical( self.dist)
         return policy.sample()
 
     def observe(self, move, reward, device = None):
@@ -95,7 +91,11 @@ class rnnJanken(nn.Module):
     
         out, h = self.forward(inputs, self.hidden_state)
         self.hidden_state = h
-        self.dist = counter_policy(self.softmax(out).squeeze(0), device)
+        self.opp_dist = self.softmax(out).squeeze(0)
+        self.dist = torch.zeros(3)
+        best = torch.argmax(self.opp_dist + 1)%3
+        self.dist[best] = 1.
+        self.dist = self.epsilon*UNIFORM + (1-self.epsilon)*self.dist
     
     def encode(self, opp_moves, moves, device = None):
         if device is not None:
@@ -109,7 +109,7 @@ class rnnJanken(nn.Module):
 
     def reset(self):
         self.hidden_state = None
-        self.dist = UNIFORM 
+        self.opp_dist = UNIFORM 
 
 class randJanken():
     '''Random janken player chooses a random policy distribution and randomly resets it.
@@ -440,7 +440,7 @@ class constJanken():
         self.move = randint(0,2)
 
     def __str__(self):
-        return f"const: reset_prob = {self.reset_prob}"
+        return f"const: reset_prob = {self.reset_prob:.3f}"
     
     def throw(self):
         return torch.tensor(self.move)
@@ -452,42 +452,58 @@ class constJanken():
 
     def reset(self):
         self.move = randint(0,2)
+    
+    @property
+    def dist(self):
+        d = torch.zeros(3)
+        d[self.move] = 1.
+        return d
 
 class bayesJanken():
     def __init__(self, **kwargs):
-        self.reset_prob = kwargs.get("reset_prob", 0.05)
-        self.coin = Bernoulli( torch.tensor(self.reset_prob)) 
+        self.gamma = kwargs.get("gamma", 0.05)
         self.rewards = Beta(torch.ones(3), torch.ones(3))
         
     def observe(self, move, reward):
-        flip = self.coin.sample()
-        if flip.item() == 1:
-            self.reset()
-
+        if isinstance(reward, torch.Tensor):
+            reward = reward.item()
+        alpha = (1-self.gamma)*self.rewards.concentration1\
+                + self.gamma*torch.ones(3)
+        beta = (1-self.gamma)*self.rewards.concentration0\
+                + self.gamma*torch.ones(3)
         if reward == 1:
-            self.rewards.concentration1[move] += reward
+            alpha[move] += reward
         else:
-            self.rewards.concentration2[move] -= reward
+            beta[move] -= reward
+        self.rewards = Beta(alpha, beta)
     
     def __str__(self):
-        return f"bayes: reset_prob = {self.reset_prob}"
+        return f"bayes: gamma = {self.gamma:.3f}" 
 
     def reset(self):
-        self.rewards = Beta( torch.ones(3), torch.ones(3))
+        self.rewards = Beta(torch.ones(3), torch.ones(3))
        
     def throw(self):
         dist = self.rewards.sample()
         return torch.argmax(dist) 
-
+    
+    @property
+    def dist(self):
+        alpha = self.rewards.concentration1
+        beta = self.rewards.concentration0
+        return alpha/(alpha + beta)
+        
 class Observation():
     def __init__(self, move = None, step = 0):
         self.lastOpponentAction = move
         self.step = step
 
 if __name__ == "__main__":
-    j = lstmJanken()
+    torch.set_grad_enabled(False)
+    torch.set_printoptions(sci_mode = False, precision = 3)
+    j = rnnJanken()
     j.eval()
-    w = torch.load("weights/j_32.pt", map_location = torch.device("cpu"))
+    w = torch.load("weights/j_6.pt", map_location = torch.device("cpu"))
     j.load_state_dict(w["model_state_dict"])
     score = 0
     while(True):
@@ -497,6 +513,6 @@ if __name__ == "__main__":
         print(m.item())
         r = WIN[m,i]
         j.observe(m, r)
-        print(j.dist)
+        print(j.opp_dist)
         score -= r.item()
          

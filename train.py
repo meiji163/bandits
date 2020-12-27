@@ -4,6 +4,7 @@ from janken import *
 from random import randint, choice, uniform
 from glob import glob
 import os
+import sys
 import torch
 
 def train(bot, bot_op, optimizer, err, **kwargs):
@@ -11,30 +12,32 @@ def train(bot, bot_op, optimizer, err, **kwargs):
     n_it = kwargs.get("n_it", 128)
     device = kwargs.get("device")    
     n_games = kwargs.get("n_games", 5)
+    dataset = kwargs.get("data")
     stats = kwargs.get("stats")
   
     for game in range(n_games):
         bot.reset()
         bot_op.reset()
+
         rewards = []
         hidden_states = []
-
         targets = []
         moves = []
         opp_moves = []
+        norm_reward = 0.
         for _ in range(n_it):
             for i in range(interval):
                 m1 = bot.throw()
                 m2 = bot_op.throw()
                 
                 reward = WIN[m1,m2]
+                rewards.append(reward - optim_reward(bot_op.dist)) 
                 bot.observe(m1, reward, device)
                 if isinstance(bot_op, rnnJanken) or isinstance(bot_op, pucbJanken):
                     bot_op.observe(m2, reward, device)
                 else:
                     bot_op.observe(m2, -reward)
                 
-                rewards.append(reward.item() - max_reward(bot_op.dist).item())
                 if i == interval-1:
                     moves.append( m1.unsqueeze(0))
                     opp_moves.append( m2.unsqueeze(0))
@@ -48,10 +51,17 @@ def train(bot, bot_op, optimizer, err, **kwargs):
         hidden_states = torch.cat( hidden_states, dim = 1).to(device)
         encoded = bot.encode(*inputs, device)
         outputs, _ = bot(encoded, hidden_states)
+        
+        #save data for later
+        dataset["states"].append(hidden_states.data)
+        dataset["inputs"].append(encoded.data)
+        dataset["targets"].append(targets.data)
+
         loss = err(outputs, targets)
         
         avg_reward = sum(rewards)/len(rewards)
-        loss *= -(avg_reward 
+        loss *= -avg_reward.item()
+        loss = loss.to(device)
         #backpropagate
         optimizer.zero_grad()
         loss.backward(retain_graph = False if game == n_games -1 else True)
@@ -59,8 +69,29 @@ def train(bot, bot_op, optimizer, err, **kwargs):
         if stats is not None:
             stats.append(avg_reward)
 
-        print(f"{sum(rewards):.0f}/{len(rewards)}\t loss: {loss.item():.3f}")
-    
+        print(f"reward: {avg_reward.item():.3f}\tloss: {loss.item():.3f}")
+   
+
+def replay_train(bot, dataset, n_batch, optimizer, err, device):
+        if n_batch <= 0:
+            return
+        print("Replay")
+        running_loss = 0.
+        for _ in range(n_batch):
+            #replay random game
+            i = randint(0, len(dataset["inputs"])-1)
+            inputs = dataset["inputs"][i]
+            targets = dataset["targets"][i]
+            hidden_states = dataset["states"][i] 
+            inputs, targets, hidden_states = inputs.to(device), targets.to(device), hidden_states.to(device)
+            outputs, _ = bot(inputs, hidden_states)
+            loss = err( outputs, targets)
+            running_loss += loss
+            optimizer.zero_grad()
+            loss.backward(retain_graph = True)
+            optimizer.step()
+        print(f"loss: {running_loss/n_batch:.3f}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = "training script for Janken bot")
     parser.add_argument("-n", help = "number of opponents per epoch", type = int, dest = 'n', default = 10)
@@ -72,7 +103,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda") #torch.device("cuda" if torch.cuda.is_available else "cpu")
  
-    j = lstmJanken()
+    j = rnnJanken(model_type = "GRU")
     j.train()
     j.to(device)
     weight_paths = glob("weights/j_*.pt")
@@ -104,10 +135,13 @@ if __name__ == "__main__":
                     if torch.is_tensor(t):
                         state[k] = t.cuda()
 
+    dataset = {"inputs":[], "states":[], "targets":[]}
+
     for epoch in range(args.e):
-        for _ in range(args.n):
+        for opp_round in range(args.n):
             #choose the opponent and random hyperparameters
-            opps = ["const", "rand", "copy", "exp3r", "ucb", "unif", "ser"]+ 3*["pucb","rnn"]
+            opps = ["const", "rand", "copy", "exp3r",
+                    "ucb", "unif", "bayes","rnn"]
             opp = choice(opps) 
 
             if opp == "rand":
@@ -146,7 +180,7 @@ if __name__ == "__main__":
             elif opp == "rnn" or opp == "pucb":
                 opp_weight = choice(weight_paths)
                 weights = torch.load(opp_weight, map_location = device)
-                p = lstmJanken()
+                p = rnnJanken(model_type = "GRU", epsilon = 0.2)
                 p.load_state_dict(weights["model_state_dict"])
                 p.id = weights["id"]
                 p.to(device)
@@ -166,17 +200,26 @@ if __name__ == "__main__":
                 j_op = copyJanken(epsilon = e)
         
             elif opp == "bayes":
-                prob = uniform(0,0.6)
-                j_op = bayesJanken(reset_prob = prob)
-
+                j_op = bayesJanken(gamma = uniform(0,0.8))
 
             print(f"\nEpoch {epoch+1} --- playing vs {j_op}")
             stats = []
             j.reset()
-            train(j, j_op, optimizer, err, 
-                            device = device,
-                            n_games = args.g,
-                            stats = stats)
+
+            try:
+                train(j, j_op, optimizer, err, 
+                                device = device,
+                                n_games = args.g,
+                                data = dataset,
+                                stats = stats)
+            except KeyboardInterrupt:
+                s = input("save data? (y/n)")
+                if s == "y":
+                    torch.save(dataset, f"data_{j.id}.pt")
+                sys.exit()
+
+            replay_train(j, dataset, (opp_round)*args.g, optimizer, err, device)
+            torch.save(dataset, "data.pt")
 
             with open(args.f, 'a') as f:
                 f.write("Epoch {epoch + 1} vs. {j_op}\n")
@@ -188,4 +231,5 @@ if __name__ == "__main__":
         weight_paths.append(out_path)
         torch.save( {"model_state_dict": j.state_dict(), "id": j.id}, out_path)
 
+    torch.save(dataset, f"data_{j.id}.pt")
     torch.save( optimizer.state_dict(), optim_path)
