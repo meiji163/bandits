@@ -1,3 +1,10 @@
+'''
+This module has some Janken (rock-paper-scissors) algorithms.
+Each class is a bot with a throw and observe method: 
+    * bot.throw() throws a move, 
+    * bot.observe(move, reward) observes the reward (0,1,-1)
+        for bot's previous move
+'''
 from math import sqrt, log, exp
 from random import randint, choice
 from copy import copy
@@ -22,12 +29,14 @@ WIN = torch.Tensor([[ 0, -1,  1],
 UNIFORM = 1/3*torch.ones(3)
 
 def expected_reward(dist_1, dist_2, device = None):
+    '''Expected reward for playing dist_1 against dist_2'''
     global WIN 
     if device is not None:
         return dist_1.to(device)@ WIN.to(device)@ dist_2.to(device)
     return dist_1 @ WIN @ dist_2
 
 def counter_policy(dist, epsilon = 0.25, device = torch.device("cpu")):
+    '''The policy that maximizes expected reward against dist'''
     global WIN
     global UNIFORM
 
@@ -42,6 +51,15 @@ def optim_reward(dist, device = None):
     return expected_reward(counter_policy(dist, 0.25), dist, device)
 
 class rnnJanken(nn.Module):
+    '''RNN guesses distribution of opponent's next move 
+    based on previous observations.
+    args:
+        model_type (str): GRU or LSTM
+        epsilon (float): throw epsilon-greedy moves
+    attributes:
+        opp_dist: the opponent distribution
+        dist: agent's policy
+    '''
     def __init__(self, model_type = "GRU", epsilon = 0.1):
         super(rnnJanken, self).__init__()
         self.epsilon = epsilon
@@ -60,8 +78,6 @@ class rnnJanken(nn.Module):
                                     bias = False,
                                     batch_first = True,
                                     dropout = 0.1)
-        else:
-            raise ValueError("model_type must be `GRU` or `LSTM`")
 
         self.lin = nn.Linear(self.hidden_size, 3)
         self.hidden_state = None
@@ -73,6 +89,7 @@ class rnnJanken(nn.Module):
         return f"{self.model_type}: {self.id}"
      
     def forward(self, inputs, state = None):
+        '''Input is an encoded sequence of moves'''
         if state is None:
             y, new_state = self.rnn(inputs)
         else:
@@ -94,10 +111,14 @@ class rnnJanken(nn.Module):
         self.opp_dist = self.softmax(out).squeeze(0)
         self.dist = torch.zeros(3)
         best = torch.argmax(self.opp_dist + 1)%3
+
+        #define the response strategy
         self.dist[best] = 1.
         self.dist = self.epsilon*UNIFORM + (1-self.epsilon)*self.dist
     
     def encode(self, opp_moves, moves, device = None):
+        '''Encodes size (batch,n,1) sequences of opponent moves and agent moves
+        as size (batch,n,9) sequence.'''
         if device is not None:
             moves = moves.to(device)
             opp_moves = opp_moves.to(device)
@@ -280,7 +301,7 @@ class ucbJanken():
 class pucbJanken(ucbJanken):
     '''PUCB algorithm with RNN predictor
     args:
-        predictor (gruJanken or lstmJanken)'''
+        predictor (rnnJanken)'''
     def __init__(self, predictor, **kwargs):
         super(pucbJanken, self).__init__(**kwargs)
         self.predictor = predictor
@@ -327,6 +348,13 @@ class pucbJanken(ucbJanken):
         d = (1-self.epsilon)*d + (self.epsilon/3)*torch.ones(3)
 
 class serJanken():
+    '''Successive Elimination Round with Randomized Round-Robin and Resets
+    (https://link.springer.com/article/10.1007/s41060-017-0050-5)
+    kwargs:
+        delta (float): constant to control uncertainty of elimination 
+                       between 0 and 0.5 
+        epsilon (float): uncertainty in drift detection 
+        reset_prob (float): probability of resetting'''
     def __init__(self, **kwargs):
         self.delta = kwargs.get("delta", 0.35)
         self.epsilon = kwargs.get("epsilon", 0.3)
@@ -346,11 +374,11 @@ class serJanken():
     def throw(self):
         if self.best is not None:
             return torch.tensor(self.best)
-        k = randint(0, len(self.not_played) - 1) 
-        m = self.not_played.pop(k) 
         if not self.not_played:
             self.round += 1
             self.not_played = list(self.arms) 
+        k = randint(0, len(self.not_played) - 1) 
+        m = self.not_played.pop(k) 
         return torch.tensor(m)
 
     def observe(self, move, reward):
@@ -401,6 +429,7 @@ class serJanken():
             return d
 
 class copyJanken():
+    '''Copies opponent's last move'''
     def __init__(self, epsilon = 0.5):
         self.epsilon = epsilon
         self.explore = Bernoulli(torch.tensor(self.epsilon))
@@ -430,6 +459,7 @@ class copyJanken():
         return d
 
 class constJanken():
+    '''Plays the same move until reset'''
     def __init__(self, reset_prob = 0.5):
         if isinstance(reset_prob, torch.Tensor):
             self.coin = Bernoulli(reset_prob)
@@ -460,6 +490,9 @@ class constJanken():
         return d
 
 class bayesJanken():
+    '''Bayesian inference with exploration
+    kwargs:
+        gamma (float): exploration constant between 0 and 1'''
     def __init__(self, **kwargs):
         self.gamma = kwargs.get("gamma", 0.05)
         self.rewards = Beta(torch.ones(3), torch.ones(3))

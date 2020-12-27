@@ -6,6 +6,8 @@ from glob import glob
 import os
 import sys
 import torch
+from torch.utils.data import DataLoader
+from torch.utils.data.dataset import TensorDataset
 
 def train(bot, bot_op, optimizer, err, **kwargs):
     interval = kwargs.get("interval", 10)
@@ -72,10 +74,37 @@ def train(bot, bot_op, optimizer, err, **kwargs):
         print(f"reward: {avg_reward.item():.3f}\tloss: {loss.item():.3f}")
    
 
-def replay_train(bot, dataset, n_batch, optimizer, err, device):
+def replay_train(bot, optimizer, err, **kwargs):
+        device = kwargs.get("device")
+        dataset = kwargs.get("data")
+        n_batch = kwargs.get("n_batch")
+        epochs = kwargs.get("epochs",1)
+        print("Replay")
+        if isinstance(data, TensorDataset):
+            loader = DataLoader( data, batch_size = 64,
+                                shufffle = True,
+                                pin_memory = True)
+            for e in range(epoch):
+                for i, data in enumerate(loader):
+                    running_loss = 0.
+                    inputs, states, targets = data
+                    inputs = inputs.to(device)
+                    states = torch.transpose(states, 0,1).to(device)
+                    targets = targets.to(device)
+                    out, _ = bot(inputs, hidden_states)
+
+                    loss = err(out, targets)
+                    running_loss += loss
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    if i%100 == 99:
+                        print(f"loss: {running_loss/100:.3f}")
+                        running_loss = 0.
+             
         if n_batch <= 0:
             return
-        print("Replay")
         running_loss = 0.
         for _ in range(n_batch):
             #replay random game
@@ -99,8 +128,9 @@ if __name__ == "__main__":
     parser.add_argument("-e", help = "number of epochs", type = int, dest = 'e', required = True)
     parser.add_argument("-f", help = "file to write stats", type = str, dest = 'f',\
                               default = os.path.join( os.getcwd(), "stats.txt"))
+    parser.add_argument("--data", type = str, dest = "data")
+    parser.add_argument("--replay", action = "store_true", dest = "replay")
     args = parser.parse_args()    
-
     device = torch.device("cuda") #torch.device("cuda" if torch.cuda.is_available else "cpu")
  
     j = rnnJanken(model_type = "GRU")
@@ -134,102 +164,116 @@ if __name__ == "__main__":
                 for k, t in state.items():
                     if torch.is_tensor(t):
                         state[k] = t.cuda()
+    if args.data:
+        dataset = torch.load(args.data, map_location = device)
+    else:
+        dataset = {"inputs":[], "states":[], "targets":[]}
 
-    dataset = {"inputs":[], "states":[], "targets":[]}
+    if args.replay:
+        targs = torch.cat(data["targets"])
+        states = torch.cat(data["states"], dim = 1)
+        states = torch.transpose(states, 0,1)
+        inputs = torch.cat(data["inputs"]).squeeze(1)
+        tensor_data = TensorDataset(inps, states, targs)
+        replay_train(j, optimizer, err,
+                    device = device,
+                    data = tensor_data)
+    else: 
+        for epoch in range(args.e):
+            for opp_round in range(args.n):
+                #choose the opponent and random hyperparameters
+                opps = ["const", "rand", "copy", "exp3r",
+                        "ucb", "unif", "bayes","rnn"]
+                opp = choice(opps) 
 
-    for epoch in range(args.e):
-        for opp_round in range(args.n):
-            #choose the opponent and random hyperparameters
-            opps = ["const", "rand", "copy", "exp3r",
-                    "ucb", "unif", "bayes","rnn"]
-            opp = choice(opps) 
+                if opp == "rand":
+                    reset_time = randint(2,100)
+                    b = 0.8*torch.rand(1).item()
+                    j_op = randJanken(bias = b, reset_prob = 1/reset_time)
 
-            if opp == "rand":
-                reset_time = randint(2,100)
-                b = 0.8*torch.rand(1).item()
-                j_op = randJanken(bias = b, reset_prob = 1/reset_time)
+                elif opp == "const":
+                    prob = torch.rand(1) 
+                    j_op = constJanken(reset_prob = prob) 
 
-            elif opp == "const":
-                prob = torch.rand(1) 
-                j_op = constJanken(reset_prob = prob) 
+                elif opp == "unif":
+                    j_op = randJanken(bias = 0, reset_prob = 0)
 
-            elif opp == "unif":
-                j_op = randJanken(bias = 0, reset_prob = 0)
+                elif opp == "exp3r":
+                    exploration = uniform(0.1, 0.4)
+                    H = randint(100,300)
+                    j_op = exp3rJanken(gamma = exploration, H = H)
 
-            elif opp == "exp3r":
-                exploration = uniform(0.1, 0.4)
-                H = randint(100,300)
-                j_op = exp3rJanken(gamma = exploration, H = H)
+                elif opp == "ucb":
+                    reset_time = randint(2,30)
+                    exploration = uniform(0,4) 
+                    e = uniform(0, 0.6) 
+                    j_op = ucbJanken(gamma = exploration,
+                                     epsilon = e,
+                                     reset_prob = 1/reset_time)
 
-            elif opp == "ucb":
-                reset_time = randint(2,30)
-                exploration = uniform(0,4) 
-                e = uniform(0, 0.6) 
-                j_op = ucbJanken(gamma = exploration,
-                                 epsilon = e,
-                                 reset_prob = 1/reset_time)
+                elif opp == "ser":
+                    prob = uniform(0,1) 
+                    e = uniform(0.2,0.8) 
+                    delta = uniform(0, 0.5) 
+                    j_op = serJanken(delta = delta,
+                                    reset_prob = prob, 
+                                    epsilon = e)
 
-            elif opp == "ser":
-                prob = uniform(0,1) 
-                e = uniform(0.2,0.8) 
-                delta = uniform(0, 0.5) 
-                j_op = serJanken(delta = delta,
-                                reset_prob = prob, 
-                                epsilon = e)
-
-            elif opp == "rnn" or opp == "pucb":
-                opp_weight = choice(weight_paths)
-                weights = torch.load(opp_weight, map_location = device)
-                p = rnnJanken(model_type = "GRU", epsilon = 0.2)
-                p.load_state_dict(weights["model_state_dict"])
-                p.id = weights["id"]
-                p.to(device)
-                p.eval()
-                if opp == "pucb":
-                    prob = uniform(0.2,1)
-                    exploration = uniform(0,4)
-                    e = uniform(0,0.5)
-                    j_op = pucbJanken(p, gamma = exploration,
-                                 epsilon = e,
-                                 reset_prob = prob) 
-                else:
-                    j_op = p
+                elif opp == "rnn" or opp == "pucb":
+                    opp_weight = choice(weight_paths)
+                    weights = torch.load(opp_weight, map_location = device)
+                    p = rnnJanken(model_type = "GRU", epsilon = 0.2)
+                    p.load_state_dict(weights["model_state_dict"])
+                    p.id = weights["id"]
+                    p.to(device)
+                    p.eval()
+                    if opp == "pucb":
+                        prob = uniform(0.2,1)
+                        exploration = uniform(0,4)
+                        e = uniform(0,0.5)
+                        j_op = pucbJanken(p, gamma = exploration,
+                                     epsilon = e,
+                                     reset_prob = prob) 
+                    else:
+                        j_op = p
+                
+                elif opp == "copy":
+                    e = uniform(0.2,1) 
+                    j_op = copyJanken(epsilon = e)
             
-            elif opp == "copy":
-                e = uniform(0.2,1) 
-                j_op = copyJanken(epsilon = e)
-        
-            elif opp == "bayes":
-                j_op = bayesJanken(gamma = uniform(0,0.8))
+                elif opp == "bayes":
+                    j_op = bayesJanken(gamma = uniform(0,0.8))
 
-            print(f"\nEpoch {epoch+1} --- playing vs {j_op}")
-            stats = []
-            j.reset()
+                print(f"\nEpoch {epoch+1} --- playing vs {j_op}")
+                stats = []
+                j.reset()
 
-            try:
-                train(j, j_op, optimizer, err, 
-                                device = device,
-                                n_games = args.g,
-                                data = dataset,
-                                stats = stats)
-            except KeyboardInterrupt:
-                s = input("save data? (y/n)")
-                if s == "y":
-                    torch.save(dataset, f"data_{j.id}.pt")
-                sys.exit()
+                try:
+                    train(j, j_op, optimizer, err, 
+                                    device = device,
+                                    n_games = args.g,
+                                    data = dataset,
+                                    stats = stats)
+                except KeyboardInterrupt:
+                    s = input("save data? (y/n)")
+                    if s == "y":
+                        torch.save(dataset, f"data_{j.id}.pt")
+                    sys.exit()
 
-            replay_train(j, dataset, (opp_round)*args.g, optimizer, err, device)
-            torch.save(dataset, "data.pt")
+                replay_train(j, optimizer, err,
+                            data = dataset, 
+                            n_batch = (opp_round)*args.g, 
+                            device = device)
 
-            with open(args.f, 'a') as f:
-                f.write("Epoch {epoch + 1} vs. {j_op}\n")
-                f.write( ','.join([format( x, ".3f") for x in stats]))
-                f.write('\n')
-            
-        j.id += 1
-        out_path = os.path.join( os.getcwd(), "weights", f"j_{j.id}.pt")
-        weight_paths.append(out_path)
-        torch.save( {"model_state_dict": j.state_dict(), "id": j.id}, out_path)
+                with open(args.f, 'a') as f:
+                    f.write(f"Epoch {epoch + 1} vs. {j_op}\n")
+                    f.write( ','.join([format( x, ".3f") for x in stats]))
+                    f.write('\n')
+                
+            j.id += 1
+            out_path = os.path.join( os.getcwd(), "weights", f"j_{j.id}.pt")
+            weight_paths.append(out_path)
+        torch.save(dataset, f"data_{j.id}.pt")
 
-    torch.save(dataset, f"data_{j.id}.pt")
+    torch.save( {"model_state_dict": j.state_dict(), "id": j.id}, out_path)
     torch.save( optimizer.state_dict(), optim_path)
