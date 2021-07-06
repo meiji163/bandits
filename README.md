@@ -1,4 +1,4 @@
-## Janken (Rock Paper Scissors) Algorithms
+## Multi-Armed Bandit Algorithms
 
 RNN (LSTM or GRU) 
 * guesses the opponent policy distribution based on sequence of previous moves
